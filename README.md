@@ -124,7 +124,7 @@ These can be used in a development environment, such as querying with [Comunica 
 Furthermore, this will add pre-commit hooks using [husky](https://www.npmjs.com/package/husky) to build, lint and test.
 These hooks can temporarily be disabled at your own risk by adding the `-n` flag to the commit command.
 
-## Benchmarking
+## Benchmarking 
 
 If you want to do benchmarking with Comunica in Node.js,
 make sure to run Node.js in production mode as follows:

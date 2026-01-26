@@ -126,8 +126,7 @@ These hooks can temporarily be disabled at your own risk by adding the `-n` flag
 
 ## Benchmarking
 
-If you want to do benchmarking with Comunica in Node.js,
-make sure to run Node.js in production mode as follows:
+If you want to do benchmarking with Comunica in Node.js, make sure to run Node.js in production mode as follows:
 
 ```bash
 > NODE_ENV=production node packages/some-package/bin/some-bin.js

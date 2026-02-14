@@ -2,15 +2,14 @@ import type { IActionHttp, IActorHttpOutput, IActorHttpArgs, MediatorHttp } from
 import { ActorHttp } from '@comunica/bus-http';
 import { KeysHttp } from '@comunica/context-entries';
 import type { TestResult } from '@comunica/core';
-import { ActionContextKey, failTest, passTest } from '@comunica/core';
+import { failTest, passTest } from '@comunica/core';
 import type { IMediatorTypeTime } from '@comunica/mediatortype-time';
 import { PassThrough } from 'readable-stream';
 
 export class ActorHttpRetryBody extends ActorHttp {
   private readonly mediatorHttp: MediatorHttp;
 
-  // Context key to indicate that the actor has already wrapped the given request
-  private static readonly keyWrapped = new ActionContextKey<boolean>('urn:comunica:actor-http-retry-body#wrapped');
+  private static readonly contentLengthRegex = /^[0-9]+$/u;
 
   public constructor(args: IActorHttpRetryBodyArgs) {
     super(args);
@@ -18,12 +17,17 @@ export class ActorHttpRetryBody extends ActorHttp {
   }
 
   public async test(action: IActionHttp): Promise<TestResult<IMediatorTypeTime>> {
-    if (action.context.has(ActorHttpRetryBody.keyWrapped)) {
-      return failTest(`${this.name} can only wrap a request once`);
-    }
     const retryCount = action.context.get(KeysHttp.httpRetryBodyCount);
     if (!retryCount || retryCount < 1) {
       return failTest(`${this.name} requires a retry count greater than zero to function`);
+    }
+    const allowUnsafe = action.context.get(KeysHttp.httpRetryBodyAllowUnsafe) ?? false;
+    const method = ActorHttpRetryBody.getRequestMethod(action);
+    if (!ActorHttpRetryBody.isIdempotentMethod(method) && !allowUnsafe) {
+      return failTest(`${this.name} can only retry idempotent request methods by default`);
+    }
+    if (!ActorHttpRetryBody.isReplayableRequestBody(action) && !allowUnsafe) {
+      return failTest(`${this.name} can only retry replayable request bodies by default`);
     }
     return passTest({ time: 0 });
   }
@@ -32,42 +36,24 @@ export class ActorHttpRetryBody extends ActorHttp {
     const url = ActorHttp.getInputUrl(action.input);
     const retryCount = action.context.getSafe(KeysHttp.httpRetryBodyCount);
     const retryDelayFallback = action.context.get(KeysHttp.httpRetryBodyDelayFallback) ?? 0;
-    const allowUnsafe = action.context.get(KeysHttp.httpRetryBodyAllowUnsafe) ?? false;
     const maxBytes = action.context.get(KeysHttp.httpRetryBodyMaxBytes);
 
     const response = await this.mediatorHttp.mediate({
       ...action,
-      context: action.context.set(ActorHttpRetryBody.keyWrapped, true),
+      context: action.context.delete(KeysHttp.httpRetryBodyCount),
     });
 
     if (!response.ok || !response.body) {
       return response;
     }
 
-    const method = ActorHttpRetryBody.getRequestMethod(action);
-    if (!ActorHttpRetryBody.isIdempotentMethod(method) && !allowUnsafe) {
-      this.logWarn(action.context, 'Skipping body retry for non-idempotent request method', () => ({
-        url: url.href,
-        method,
-      }));
-      return response;
-    }
-
-    if (!ActorHttpRetryBody.isReplayableRequestBody(action) && !allowUnsafe) {
-      this.logWarn(action.context, 'Skipping body retry for non-replayable request body', () => ({
-        url: url.href,
-        method,
-      }));
-      return response;
-    }
-
     const attemptLimit = retryCount + 1;
 
     if (maxBytes !== undefined) {
-      const contentLengthHeader = response.headers.get('content-length');
-      if (contentLengthHeader) {
-        const contentLength = Number.parseInt(contentLengthHeader, 10);
-        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      const contentLengthHeader = response.headers.get('content-length')?.trim();
+      if (contentLengthHeader && ActorHttpRetryBody.contentLengthRegex.test(contentLengthHeader)) {
+        const contentLength = Number(contentLengthHeader);
+        if (contentLength > maxBytes) {
           this.logWarn(action.context, 'Skipping body retry due to content-length exceeding max bytes', () => ({
             url: url.href,
             contentLength,
@@ -88,12 +74,14 @@ export class ActorHttpRetryBody extends ActorHttp {
     );
 
     const retryingBodyWeb = ActorHttp.toWebReadableStream(retryingBody);
-    Object.defineProperty(response, 'body', {
-      configurable: true,
-      enumerable: true,
-      get: () => retryingBodyWeb,
+    const wrappedResponse = <IActorHttpOutput> new Response(retryingBodyWeb, {
+      headers: response.headers,
+      status: response.status,
+      statusText: response.statusText,
     });
-    return response;
+    wrappedResponse.cachePolicy = response.cachePolicy;
+    wrappedResponse.fromCache = response.fromCache;
+    return wrappedResponse;
   }
 
   /**
@@ -117,7 +105,10 @@ export class ActorHttpRetryBody extends ActorHttp {
     url: URL,
     maxBytes: number | undefined,
   ): NodeJS.ReadableStream {
+    // Expose a single body stream that can re-issue the request if the original body errors/closes early.
     const output = new PassThrough();
+
+    // Retry/buffering state (attempts is 1-based: the initial body is attempt 1).
     let attempts = 1;
     let done = false;
     let retrying = false;
@@ -133,6 +124,7 @@ export class ActorHttpRetryBody extends ActorHttp {
     };
 
     const pipeBody = (body: NodeJS.ReadableStream): void => {
+      // Buffer per attempt so consumers only see data once we know the stream ended cleanly.
       currentBody = body;
       bufferedBytes = 0;
       const chunks: Buffer[] = [];
@@ -151,6 +143,7 @@ export class ActorHttpRetryBody extends ActorHttp {
         chunks.push(buffer);
 
         if (!overflowHandled && maxBytes !== undefined && bufferedBytes > maxBytes) {
+          // `maxBytes` exceeded: stop retrying and switch to pass-through streaming for the remainder.
           overflowHandled = true;
           if ('pause' in body && typeof body.pause === 'function') {
             body.pause();
@@ -172,6 +165,7 @@ export class ActorHttpRetryBody extends ActorHttp {
           }
           chunks.length = 0;
 
+          // Streaming mode: no retry; treat premature close as an error.
           let bodyEnded = false;
           body.once('end', () => {
             bodyEnded = true;
@@ -192,6 +186,7 @@ export class ActorHttpRetryBody extends ActorHttp {
       };
 
       const onEnd = (): void => {
+        // Only flush buffered data after a clean 'end' so consumers never see partial bodies.
         cleanup();
         if (isOutputClosed()) {
           done = true;
@@ -271,9 +266,10 @@ export class ActorHttpRetryBody extends ActorHttp {
           return;
         }
 
+        // Re-run the original HTTP action to obtain a fresh response body stream.
         const response = await this.mediatorHttp.mediate({
           ...action,
-          context: action.context.set(ActorHttpRetryBody.keyWrapped, true),
+          context: action.context.delete(KeysHttp.httpRetryBodyCount),
         });
 
         if (!response.ok || !response.body) {

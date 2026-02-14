@@ -44,15 +44,47 @@ describe('ActorHttpRetryBody', () => {
       await expect(actor.test({ input, context })).resolves.toFailTest(`${actor.name} requires a retry count greater than zero to function`);
     });
 
-    it('should reject when the action has already been wrapped by it once', async() => {
-      const context = new ActionContext({ [(<any>ActorHttpRetryBody).keyWrapped.name]: true });
-      await expect(actor.test({ input, context })).resolves
-        .toFailTest(`${actor.name} can only wrap a request once`);
-    });
-
     it('should accept when retry count is provided in the context', async() => {
       const context = new ActionContext({ [KeysHttp.httpRetryBodyCount.name]: 1 });
       await expect(actor.test({ input, context })).resolves.toPassTest({ time: 0 });
+    });
+
+    it('should reject for non-idempotent methods by default', async() => {
+      await expect(actor.test({ input, context, init: { method: 'POST' }})).resolves
+        .toFailTest('actor can only retry idempotent request methods by default');
+    });
+
+    it('should accept for non-idempotent methods when allowed', async() => {
+      const context = new ActionContext({
+        [KeysHttp.httpRetryBodyCount.name]: 1,
+        [KeysHttp.httpRetryBodyAllowUnsafe.name]: true,
+      });
+      await expect(actor.test({ input, context, init: { method: 'POST' }})).resolves.toPassTest({ time: 0 });
+    });
+
+    it('should reject for non-replayable request bodies by default', async() => {
+      const requestBody = new Readable({
+        read() {
+          this.push('request');
+          this.push(null);
+        },
+      });
+      await expect(actor.test({ input, context, init: { body: <any> requestBody }})).resolves
+        .toFailTest('actor can only retry replayable request bodies by default');
+    });
+
+    it('should accept for non-replayable request bodies when allowed', async() => {
+      const context = new ActionContext({
+        [KeysHttp.httpRetryBodyCount.name]: 1,
+        [KeysHttp.httpRetryBodyAllowUnsafe.name]: true,
+      });
+      const requestBody = new Readable({
+        read() {
+          this.push('request');
+          this.push(null);
+        },
+      });
+      await expect(actor.test({ input, context, init: { body: <any> requestBody }})).resolves.toPassTest({ time: 0 });
     });
   });
 
@@ -64,6 +96,22 @@ describe('ActorHttpRetryBody', () => {
         }
         this.destroy(new Error('Body stream error'));
       },
+    });
+
+    it('should remove retry body count from the mediated action context', async() => {
+      const body = Readable.from([ 'abcdef' ]);
+      const mediateSpy = jest.spyOn(mediatorHttp, 'mediate').mockResolvedValue(<any> {
+        ok: true,
+        status: 200,
+        body,
+        headers: new Headers(),
+      });
+
+      const response = await actor.run({ input, context });
+      await arrayifyStream(ActorHttp.toNodeReadable(<any> response.body));
+
+      expect(mediateSpy).toHaveBeenCalledTimes(1);
+      expect(mediateSpy.mock.calls[0][0].context.get(KeysHttp.httpRetryBodyCount)).toBeUndefined();
     });
 
     it('should retry and emit the successful response after stream error', async() => {
@@ -114,25 +162,6 @@ describe('ActorHttpRetryBody', () => {
       expect(mediatorHttp.mediate).toHaveBeenCalledTimes(2);
     });
 
-    it('should skip retries for non-idempotent methods by default', async() => {
-      const body = Readable.from([ 'abc' ]);
-      jest.spyOn(mediatorHttp, 'mediate').mockResolvedValue(<any> {
-        ok: true,
-        status: 200,
-        body,
-        headers: new Headers(),
-      });
-
-      const response = await actor.run({ input, context, init: { method: 'POST' }});
-      expect(response.body).toBe(body);
-      expect(mediatorHttp.mediate).toHaveBeenCalledTimes(1);
-      expect((<any> actor).logWarn).toHaveBeenCalledWith(
-        context,
-        'Skipping body retry for non-idempotent request method',
-        expect.any(Function),
-      );
-    });
-
     it('should allow retries for non-idempotent methods when allowed', async() => {
       const context = new ActionContext({
         [KeysHttp.httpRetryBodyCount.name]: 1,
@@ -149,31 +178,6 @@ describe('ActorHttpRetryBody', () => {
       const buffer = Buffer.concat(chunks.map((chunk: any) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
       expect(buffer.toString()).toBe('abcdef');
       expect(mediatorHttp.mediate).toHaveBeenCalledTimes(2);
-    });
-
-    it('should skip retries for non-replayable request bodies', async() => {
-      const body = Readable.from([ 'abc' ]);
-      const requestBody = new Readable({
-        read() {
-          this.push('request');
-          this.push(null);
-        },
-      });
-      jest.spyOn(mediatorHttp, 'mediate').mockResolvedValue(<any> {
-        ok: true,
-        status: 200,
-        body,
-        headers: new Headers(),
-      });
-
-      const response = await actor.run({ input, context, init: { body: <any> requestBody }});
-      expect(response.body).toBe(body);
-      expect(mediatorHttp.mediate).toHaveBeenCalledTimes(1);
-      expect((<any> actor).logWarn).toHaveBeenCalledWith(
-        context,
-        'Skipping body retry for non-replayable request body',
-        expect.any(Function),
-      );
     });
 
     it('should allow retries for non-replayable request bodies when allowed', async() => {
@@ -215,6 +219,27 @@ describe('ActorHttpRetryBody', () => {
 
       const response = await actor.run({ input, context });
       expect(response.body).toBe(body);
+      expect(mediatorHttp.mediate).toHaveBeenCalledTimes(1);
+    });
+
+    it('should ignore invalid content-length header values', async() => {
+      const context = new ActionContext({
+        [KeysHttp.httpRetryBodyCount.name]: 1,
+        [KeysHttp.httpRetryBodyMaxBytes.name]: 2,
+      });
+      const body = Readable.from([ 'abcdef' ]);
+      jest.spyOn(mediatorHttp, 'mediate').mockResolvedValue(<any> {
+        ok: true,
+        status: 200,
+        body,
+        headers: new Headers({ 'content-length': '6abc' }),
+      });
+
+      const response = await actor.run({ input, context });
+      expect(response.body).not.toBe(body);
+      const chunks = await arrayifyStream(ActorHttp.toNodeReadable(<any> response.body));
+      const buffer = Buffer.concat(chunks.map((chunk: any) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      expect(buffer.toString()).toBe('abcdef');
       expect(mediatorHttp.mediate).toHaveBeenCalledTimes(1);
     });
 
@@ -352,6 +377,10 @@ describe('ActorHttpRetryBody', () => {
       jest.spyOn(mediatorHttp, 'mediate').mockResolvedValue(<any> new Response('abcdef'));
 
       const response = await actor.run({ input, context });
+      expect(response.ok).toBe(true);
+      expect(response.status).toBe(200);
+      expect(response.redirected).toBe(false);
+      expect(response.url).toBe('');
       const chunks = await arrayifyStream(ActorHttp.toNodeReadable(<any> response.body));
       const buffer = Buffer.concat(chunks.map((chunk: any) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
       expect(buffer.toString()).toBe('abcdef');

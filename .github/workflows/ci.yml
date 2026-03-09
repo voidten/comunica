@@ -139,8 +139,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_LOWEST }}
           cache: yarn
-      - name: Install dependencies and build
+      - name: Install dependencies
         run: yarn install --frozen-lockfile
+      - name: Build query-sparql browser bundle
+        run: yarn workspace @comunica/query-sparql run browser
       - name: Install Playwright browsers
         run: yarn playwright install --with-deps
       - name: Run browser tests
